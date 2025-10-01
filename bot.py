@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_IDS = os.getenv("GUILD_IDS", "").split(",") if os.getenv("GUILD_IDS") else []
 
 # (La gestion par guild a été retirée) Les commandes sont synchronisées globalement.
 
@@ -511,6 +512,30 @@ async def add_credits(interaction: discord.Interaction, user: discord.User, amou
     await interaction.response.send_message(embed=embed)
     log(f"[ADMIN] {interaction.user} a ajouté {amount} écus à {user} (Nouveau solde: {balance_after})")
 
+# ---------------- RANDOM NUMBER ----------------
+@tree.command(name="random", description="Génère un nombre aléatoire entre 1 et le nombre choisi")
+async def random_number(interaction: discord.Interaction, maximum: int):
+    if maximum < 1:
+        await interaction.response.send_message("❌ Le nombre maximum doit être supérieur ou égal à 1.", ephemeral=True)
+        return
+    
+    if maximum > 1000000:
+        await interaction.response.send_message("❌ Le nombre maximum ne peut pas dépasser 1 000 000.", ephemeral=True)
+        return
+    
+    result = random.randint(1, maximum)
+    
+    embed = discord.Embed(
+        title="🎲 Nombre aléatoire",
+        color=discord.Color.purple(),
+        description=f"**Résultat : {result}**"
+    )
+    embed.add_field(name="Plage", value=f"1 - {maximum}", inline=True)
+    embed.set_footer(text=f"Généré pour {interaction.user.display_name}")
+    
+    await interaction.response.send_message(embed=embed)
+    log(f"[RANDOM] {interaction.user} a généré le nombre {result} (1-{maximum})")
+
 # ---------------- HELP ----------------
 @tree.command(name="help", description="Affiche toutes les commandes et leur fonctionnement")
 async def help_command(interaction: discord.Interaction):
@@ -574,7 +599,17 @@ async def help_command(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="🏆 /leaderboard",
+        name="� /random <maximum>",
+        value=(
+            "Génère un nombre aléatoire entre 1 et le nombre choisi.\n"
+            "- Exemple : `/random 100` génère un nombre entre 1 et 100.\n"
+            "- Maximum autorisé : 1 000 000."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="�🏆 /leaderboard",
         value=(
             "Affiche le top 10 des joueurs par solde d'écus.\n"
             "- Utilise les données stockées dans `data.json`."
@@ -747,11 +782,48 @@ async def vocrole_list(interaction: discord.Interaction):
 # ---------------- ON READY ----------------
 @bot.event
 async def on_ready():
-    # Synchronisation globale des commandes (propagation lente, ~1h)
-    await tree.sync()
-    print("✅ Commandes synchronisées globalement (propagation lente)")
     print(f"✅ Connecté en tant que {bot.user}")
+    print(f"🌐 Serveurs connectés: {len(bot.guilds)}")
+    for guild in bot.guilds:
+        print(f"   - {guild.name} (ID: {guild.id})")
+    
+    # Synchronisation des commandes
+    if GUILD_IDS and GUILD_IDS[0]:  # Si des guild IDs sont définis
+        print("🔄 Synchronisation des commandes par serveur (instantané)...")
+        for guild_id in GUILD_IDS:
+            try:
+                guild_id = int(guild_id.strip())
+                guild_obj = discord.Object(id=guild_id)
+                
+                # Trouver le nom du serveur
+                guild_name = "Serveur inconnu"
+                for guild in bot.guilds:
+                    if guild.id == guild_id:
+                        guild_name = guild.name
+                        break
+                
+                await tree.sync(guild=guild_obj)
+                print(f"✅ Commandes synchronisées pour '{guild_name}' (ID: {guild_id})")
+            except Exception as e:
+                print(f"❌ Erreur lors de la synchronisation pour le serveur {guild_id}: {e}")
+    else:
+        # Synchronisation globale (propagation lente, ~1h)
+        await tree.sync()
+        print("✅ Commandes synchronisées globalement (propagation lente)")
+    
     print("📌 Commandes disponibles :", [cmd.name for cmd in tree.get_commands()])
+    
+    # Vérifier les permissions dans chaque serveur
+    for guild in bot.guilds:
+        me = guild.me
+        print(f"🔐 Permissions dans '{guild.name}':")
+        print(f"   - send_messages: {me.guild_permissions.send_messages}")
+        print(f"   - embed_links: {me.guild_permissions.embed_links}")
+        print(f"   - use_application_commands: {me.guild_permissions.use_application_commands}")
+        if not me.guild_permissions.use_application_commands:
+            print(f"   ⚠️  ATTENTION: Le bot n'a pas la permission use_application_commands !")
+    
+    print("🚀 Bot prêt à recevoir des commandes !")
 
     # Initialize last_join for members already in voice channels (after restart)
     changed = False
@@ -771,15 +843,22 @@ async def on_ready():
     bot.loop.create_task(_voc_updater_loop())
 
 
-@tree.command(name="sync", description="[ADMIN] Forcer la synchronisation des commandes (globale)")
+@tree.command(name="sync", description="[ADMIN] Forcer la synchronisation des commandes")
 async def sync_commands(interaction: discord.Interaction):
     # Restreint aux administrateurs
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True)
         return
 
-    # Sync global
-    await tree.sync()
-    await interaction.response.send_message("✅ Synchronisation globale lancée (propagation lente)")
+    # Sync pour le serveur actuel ou global
+    if interaction.guild_id:
+        guild_name = interaction.guild.name if interaction.guild else "Serveur inconnu"
+        await tree.sync(guild=interaction.guild)
+        await interaction.response.send_message(f"✅ Synchronisation effectuée pour **{guild_name}** (instantané)")
+        print(f"🔄 [SYNC] Synchronisation manuelle effectuée pour '{guild_name}' (ID: {interaction.guild_id}) par {interaction.user}")
+    else:
+        await tree.sync()
+        await interaction.response.send_message("✅ Synchronisation globale lancée (propagation lente)")
+        print(f"🔄 [SYNC] Synchronisation globale manuelle effectuée par {interaction.user}")
 
 bot.run(TOKEN)
