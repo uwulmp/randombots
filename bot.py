@@ -3,6 +3,10 @@ from discord import app_commands
 from discord.ui import View, Button, Select
 import random, json, os, asyncio, time
 from dotenv import load_dotenv
+import io
+import zipfile
+import re
+import aiohttp
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -758,10 +762,25 @@ async def vocrole_list(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True)
         return
-    lines = []
+
+    # Group rules by role_id and merge ranges
+    grouped = {}
     for r in settings.get("voc_role_rules", []):
         rid = int(r["role_id"])
-        # Try to find role name in current guilds
+        mn = int(r["min_seconds"])
+        mx = int(r["max_seconds"])
+        if rid not in grouped:
+            grouped[rid] = {"min": mn, "max": mx}
+        else:
+            grouped[rid]["min"] = min(grouped[rid]["min"], mn)
+            grouped[rid]["max"] = max(grouped[rid]["max"], mx)
+
+    if not grouped:
+        await interaction.response.send_message("Aucune règle configurée.", ephemeral=True)
+        return
+
+    lines = []
+    for rid, span in grouped.items():
         role_name = None
         for g in bot.guilds:
             role = g.get_role(rid)
@@ -770,12 +789,10 @@ async def vocrole_list(interaction: discord.Interaction):
                 break
         if not role_name:
             role_name = str(rid)
-        lines.append(f"- {role_name}: {r['min_seconds']}s - {r['max_seconds']}s")
-    if not lines:
-        await interaction.response.send_message("Aucune règle configurée.", ephemeral=True)
-    else:
-        embed = discord.Embed(title="Règles voc role", description="\n".join(lines), color=discord.Color.blue())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        lines.append(f"- {role_name}: {span['min']}s - {span['max']}s")
+
+    embed = discord.Embed(title="Règles voc role", description="\n".join(lines), color=discord.Color.blue())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 
@@ -786,31 +803,14 @@ async def on_ready():
     print(f"🌐 Serveurs connectés: {len(bot.guilds)}")
     for guild in bot.guilds:
         print(f"   - {guild.name} (ID: {guild.id})")
-    
-    # Synchronisation des commandes
-    if GUILD_IDS and GUILD_IDS[0]:  # Si des guild IDs sont définis
-        print("🔄 Synchronisation des commandes par serveur (instantané)...")
-        for guild_id in GUILD_IDS:
-            try:
-                guild_id = int(guild_id.strip())
-                guild_obj = discord.Object(id=guild_id)
-                
-                # Trouver le nom du serveur
-                guild_name = "Serveur inconnu"
-                for guild in bot.guilds:
-                    if guild.id == guild_id:
-                        guild_name = guild.name
-                        break
-                
-                await tree.sync(guild=guild_obj)
-                print(f"✅ Commandes synchronisées pour '{guild_name}' (ID: {guild_id})")
-            except Exception as e:
-                print(f"❌ Erreur lors de la synchronisation pour le serveur {guild_id}: {e}")
-    else:
-        # Synchronisation globale (propagation lente, ~1h)
+
+    # Synchronisation globale des commandes (sans GUILD_IDS)
+    try:
         await tree.sync()
         print("✅ Commandes synchronisées globalement (propagation lente)")
-    
+    except Exception as e:
+        print(f"❌ Erreur lors de la synchronisation globale des commandes: {e}")
+
     print("📌 Commandes disponibles :", [cmd.name for cmd in tree.get_commands()])
     
     # Vérifier les permissions dans chaque serveur
@@ -860,5 +860,71 @@ async def sync_commands(interaction: discord.Interaction):
         await tree.sync()
         await interaction.response.send_message("✅ Synchronisation globale lancée (propagation lente)")
         print(f"🔄 [SYNC] Synchronisation globale manuelle effectuée par {interaction.user}")
+
+@tree.command(name="avatars", description="[ADMIN] Récupérer tous les avatars du serveur en un ZIP")
+async def avatars(interaction: discord.Interaction):
+    # Doit être exécuté dans un serveur
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Cette commande doit être utilisée dans un serveur.", ephemeral=True)
+        return
+
+    # Restreint aux administrateurs pour éviter les abus
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    members = interaction.guild.members
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    out_filename = f"avatars_{interaction.guild.id}_{timestamp}.zip"
+    out_path = os.path.join(os.getcwd(), out_filename)
+
+    try:
+        # Create ZIP on disk
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            async with aiohttp.ClientSession() as session:
+                for m in members:
+                    try:
+                        url = str(m.display_avatar.url)
+                        if not url:
+                            continue
+                        async with session.get(url) as resp:
+                            if resp.status != 200:
+                                continue
+                            content = await resp.read()
+                            ct = resp.headers.get("Content-Type", "")
+                            ext = "png"
+                            if "gif" in ct:
+                                ext = "gif"
+                            elif "webp" in ct:
+                                ext = "webp"
+                            elif "jpeg" in ct or "jpg" in ct:
+                                ext = "jpg"
+                            # sanitize filename
+                            name = re.sub(r"[^\w\-_. ]", "", m.display_name)[:50] or str(m.id)
+                            filename = f"{name}_{m.id}.{ext}"
+                            zf.writestr(filename, content)
+                    except Exception:
+                        continue
+
+        size = os.path.getsize(out_path)
+        size_mb = size / (1024 * 1024)
+        limit = 8 * 1024 * 1024
+
+        # Notify and provide local path
+        await interaction.followup.send(f"✅ ZIP généré et sauvegardé localement : `{out_path}` ({size_mb:.2f} MB)")
+        log(f"[AVATARS] {interaction.user} a généré un ZIP d'avatars local: {out_path} ({len(members)} membres)")
+
+        # If small enough, also send via Discord
+        if size <= limit:
+            try:
+                await interaction.followup.send("✅ Téléchargement via Discord :", file=discord.File(out_path))
+            except Exception:
+                # ignore send failures
+                pass
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Erreur lors de la génération du ZIP: {e}", ephemeral=True)
 
 bot.run(TOKEN)
